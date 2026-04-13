@@ -64,9 +64,11 @@ def save_user_today(user_id, doc):
 def analyze_with_claude(text):
     prompt = f"""Sos un asistente de nutrición y entrenamiento. El usuario te manda este mensaje: "{text}"
 
-Primero determiná si el mensaje es sobre:
+IMPORTANTE: Cualquier mensaje que indique que el usuario hizo ejercicio o fue al gym DEBE clasificarse como ENTRENAMIENTO, incluso si es muy corto o informal. Ejemplos de ENTRENAMIENTO: "ya entrené", "fui al gym", "listo entrené", "hice el día A", "terminé el entrenamiento", "entrené hoy", "fui a entrenar", "hice la rutina", "ya fui", "entrené".
+
+Clasificá el mensaje en:
 1. COMIDA - el usuario describe algo que comió o tomó
-2. ENTRENAMIENTO - el usuario menciona que hizo ejercicio, fue al gym, hizo el día A/B/C, entrenó, etc.
+2. ENTRENAMIENTO - cualquier referencia a haber hecho ejercicio, gym, rutina, entreno
 3. OTRO - consulta, saludo, o cualquier otra cosa
 
 Respondé SOLO con un JSON válido sin texto extra:
