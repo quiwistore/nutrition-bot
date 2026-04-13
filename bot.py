@@ -1,8 +1,8 @@
 import os
 import json
 import logging
-import tempfile
-from datetime import datetime, date
+import traceback
+from datetime import datetime, date, timedelta
 import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -21,15 +21,53 @@ client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 mongo = MongoClient(MONGODB_URL)
 db = mongo["nutrition-bot"]
 collection = db["registros"]
+logros_col = db["logros"]
+conversaciones_col = db["conversaciones"]
 
 ARG_TZ = pytz.timezone("America/Argentina/Buenos_Aires")
 
-DAILY_GOALS = {
-    "calorias": 1900,
-    "proteinas": 160,
-    "carbohidratos": 160,
-    "grasas": 65
-}
+DAILY_GOALS = {"calorias": 1900, "proteinas": 160, "carbohidratos": 160, "grasas": 65}
+
+SISTEMA = """Sos el coach personal de Agustín Méndez, 83kg, 1.73m, con rotura de LCA derecho en tratamiento conservador.
+
+Su objetivo: bajar a ~75kg con abdominales marcados, haciendo full body 3 veces por semana en el gym.
+
+Su plan nutricional:
+- Meta diaria: 1900 kcal, 160g proteína, 160g carbohidratos, 65g grasas
+- Desayuno/almuerzo: 3-5 huevos, aguacate, tostada integral, tomate
+- Batido whey (25g proteína) durante el trabajo
+- Cena: 350g pollo/merluza/carne magra + ensalada
+- Permitido: pizza 1 vez/semana, hamburguesa sin papas 1 vez/semana
+- Suplementos: creatina 5g/día, omega 3 2 caps/día, colágeno 10-15g en ayunas con vitamina C, whey proteína
+
+Su plan de entrenamiento (full body 3 días/semana, sin carga axial en rodilla derecha):
+- Día A: Press banca plano, Jalón ancho, Elevaciones laterales, Curl EZ, Pushdown polea, Crunch máquina, Curl femoral acostado, Abducción cadera
+- Día B: Press inclinado mancuernas, Remo pecho apoyado, Pájaros polea, Curl concentrado, Extensión cabeza mancuerna, Plancha lateral, Prensa rango corto, Curl femoral acostado
+- Día C: Cable crossover polea baja, Jalón neutro cerrado, Press militar sentado, Curl martillo, Pushdown cuerda, Rueda abdominal, Elevación piernas barra, Curl femoral sentado, Abducción cadera
+
+Restricciones por LCA: sin sentadillas, sin estocadas, sin peso muerto, sin cardio de impacto, sin pivotes.
+
+Tu personalidad como coach:
+- Hablás en español rioplatense, tuteo
+- Mezclás motivación real con humor y bardeo con cariño
+- Si come bien: lo felicitás con energía
+- Si se manda una cagada con la comida: lo bardeás con amor pero lo motivás a seguir
+- Si entrena: lo felicitás como si hubiera ganado un mundial
+- Sos directo, honesto, no le das la razón en todo
+- Usás emojis con moderación
+- Respondés preguntas sobre nutrición, ejercicios, suplementos con precisión
+
+CRÍTICO - Extracción de datos:
+Al final de CADA respuesta donde el usuario mencione comida o entrenamiento, agregá un bloque JSON oculto así:
+<datos>{"tipo": "comida", "descripcion": "...", "calorias": N, "proteinas": N, "carbohidratos": N, "grasas": N}</datos>
+o
+<datos>{"tipo": "entrenamiento", "descripcion": "..."}</datos>
+o
+<datos>{"tipo": "ninguno"}</datos>
+
+Si no hay comida ni entrenamiento que registrar, poné <datos>{"tipo": "ninguno"}</datos>
+Usá estimaciones realistas para porciones argentinas típicas.
+NUNCA muestres el bloque <datos> al usuario, es solo para el sistema."""
 
 def get_today_arg():
     return datetime.now(ARG_TZ).strftime("%Y-%m-%d")
@@ -62,116 +100,114 @@ def save_user_today(user_id, doc):
         }}
     )
 
-def analyze_with_claude(text):
-    prompt = f"""Sos un asistente de nutrición y entrenamiento. El usuario te manda este mensaje: "{text}"
+def get_conversation_history(user_id):
+    today = get_today_arg()
+    uid = str(user_id)
+    doc = conversaciones_col.find_one({"user_id": uid, "fecha": today})
+    if doc:
+        return doc.get("mensajes", [])
+    return []
 
-IMPORTANTE: Cualquier mensaje que indique que el usuario hizo ejercicio o fue al gym DEBE clasificarse como ENTRENAMIENTO, incluso si es muy corto o informal. Ejemplos de ENTRENAMIENTO: "ya entrené", "fui al gym", "listo entrené", "hice el día A", "terminé el entrenamiento", "entrené hoy", "fui a entrenar", "hice la rutina", "ya fui", "entrené".
-
-Clasificá el mensaje en:
-1. COMIDA - el usuario describe algo que comió o tomó
-2. ENTRENAMIENTO - cualquier referencia a haber hecho ejercicio, gym, rutina, entreno
-3. OTRO - consulta, saludo, o cualquier otra cosa
-
-Respondé SOLO con un JSON válido sin texto extra:
-
-Si es COMIDA:
-{{"tipo": "comida", "descripcion": "descripción corta", "calorias": número, "proteinas": número, "carbohidratos": número, "grasas": número, "comentario": "comentario breve en español rioplatense"}}
-
-Si es ENTRENAMIENTO:
-{{"tipo": "entrenamiento", "descripcion": "qué entrenamiento hizo", "comentario": "comentario motivador breve en español rioplatense"}}
-
-Si es OTRO:
-{{"tipo": "otro", "respuesta": "respuesta breve y amigable en español rioplatense"}}
-
-Para el campo "comentario" en comidas SÉ MUY HONESTO y divertido. Ejemplos del tono que buscamos:
-- Si comió bien: "Eso es lo que es, proteína al palo. Seguila así."
-- Si comió medialunas/alfajores/facturas: "Bah, las medialunas... clásico. Disfrutaste, pero no te olvides que eso no te acerca a los abs."
-- Si comió pizza: "La pizza semanal, bienvenida. Contala como el cheat del día y mañana volvemos al plan."
-- Si comió pollo con ensalada: "Eso sí que es comer como un campeón. Sos un monstruo."
-- Si se pasó de calorías: "Hoy te fuiste de mambo con las calorías. Mañana la revancha, no drama."
-- Si cumplió la proteína: "¡Meta de proteína cumplida! Así se construye músculo, no con rezos."
-Usá humor rioplatense, bardeo con cariño y motivación real. Máximo 2 oraciones."""
-
-    response = client_ai.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=500,
-        messages=[{"role": "user", "content": prompt}]
+def save_conversation_history(user_id, history):
+    today = get_today_arg()
+    uid = str(user_id)
+    # Mantener solo los últimos 20 mensajes para no gastar tokens
+    history = history[-20:]
+    conversaciones_col.update_one(
+        {"user_id": uid, "fecha": today},
+        {"$set": {"mensajes": history}},
+        upsert=True
     )
-    raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)
 
-def format_progress(totales):
-    lines = []
-    items = [
-        ("calorias", "🔥", "kcal"),
-        ("proteinas", "💪", "g"),
-        ("carbohidratos", "🌾", "g"),
-        ("grasas", "🫒", "g")
-    ]
-    for macro, emoji, unit in items:
-        actual = totales[macro]
-        goal = DAILY_GOALS[macro]
-        pct = min(int((actual / goal) * 100), 100)
-        bar = "█" * int(pct/10) + "░" * (10 - int(pct/10))
-        lines.append(f"{emoji} *{macro.capitalize()}*: {actual}{unit} / {goal}{unit}\n`{bar}` {pct}%")
-    return "\n\n".join(lines)
+def build_context(user_id):
+    doc = get_user_today(user_id)
+    t = doc["totales"]
+    
+    context_parts = [f"📅 Hoy es {get_today_arg()}"]
+    
+    if doc["comidas"]:
+        context_parts.append(f"Comidas registradas hoy: {', '.join([c['descripcion'] for c in doc['comidas']])}")
+        context_parts.append(f"Acumulado: {t['calorias']} kcal / {t['proteinas']}g prot / {t['carbohidratos']}g carbs / {t['grasas']}g grasas")
+        cal_rest = DAILY_GOALS['calorias'] - t['calorias']
+        prot_rest = DAILY_GOALS['proteinas'] - t['proteinas']
+        context_parts.append(f"Le quedan: {cal_rest} kcal y {prot_rest}g proteína para la meta")
+    else:
+        context_parts.append("No registró comidas hoy todavía")
+    
+    if doc["entrenamientos"]:
+        context_parts.append(f"Entrenó hoy: {doc['entrenamientos'][0]['descripcion']}")
+    else:
+        context_parts.append("No registró entrenamiento hoy")
+    
+    uid = str(user_id)
+    _, stats = check_new_achievements(collection, uid, logros_col)
+    context_parts.append(f"Racha actual: {stats['racha_actual']} días. Total entrenamientos: {stats['total_entrenos']}")
+    
+    return "\n".join(context_parts)
+
+def extract_and_clean(text):
+    import re
+    pattern = r'<datos>(.*?)</datos>'
+    match = re.search(pattern, text, re.DOTALL)
+    datos = None
+    if match:
+        try:
+            datos = json.loads(match.group(1).strip())
+        except:
+            datos = {"tipo": "ninguno"}
+        text = re.sub(pattern, '', text, flags=re.DOTALL).strip()
+    return text, datos
+
+def format_progress_inline(totales):
+    t = totales
+    cal_pct = min(int((t['calorias'] / DAILY_GOALS['calorias']) * 100), 100)
+    prot_pct = min(int((t['proteinas'] / DAILY_GOALS['proteinas']) * 100), 100)
+    return f"🔥 {t['calorias']}/{DAILY_GOALS['calorias']} kcal ({cal_pct}%) | 💪 {t['proteinas']}/{DAILY_GOALS['proteinas']}g prot ({prot_pct}%)"
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """👋 *¡Hola! Soy tu bot de nutrición y entrenamiento.*
+    msg = """👋 *¡Hola Agustín! Soy tu coach personal.*
 
-Contame lo que comiste o si entrenaste y lo registro automáticamente.
+Hablame como si fuera una persona. Contame qué comiste, si entrenaste, cómo te sentís, preguntame lo que quieras sobre el plan.
 
-*Comandos:*
+*Comandos rápidos:*
 /hoy — Resumen del día
-/historial — Últimos 7 días
+/historial — Últimos 7 días  
+/logros — Tus logros y estadísticas
 /entrenamiento — Ejercicios de hoy
 /entrenamiento A · B · C — Ver un día específico
 /ejercicio [nombre] — Cómo hacer un ejercicio
 /semana — Semana completa
-/reset — Reiniciar el día
-/logros — Ver tus logros y estadísticas
-/ayuda — Ver esta ayuda
-
-*Ejemplos:*
-• "Comí 3 huevos con aguacate y una tostada"
-• "Hice el entrenamiento de hoy"
-• "Tomé un café con leche"
-• "Fui al gym e hice el día B" """
+/reset — Reiniciar el día"""
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     doc = get_user_today(update.effective_user.id)
-
     lines = [f"📊 *Resumen de hoy — {get_today_arg()}*\n"]
-
     if doc["comidas"]:
-        lines.append("*Comidas registradas:*")
+        lines.append("*Comidas:*")
         for c in doc["comidas"]:
             lines.append(f"• {c['descripcion']} — {c['calorias']} kcal, {c['proteinas']}g prot")
         lines.append("")
+        t = doc["totales"]
+        cal_pct = min(int((t['calorias'] / DAILY_GOALS['calorias']) * 100), 100)
+        prot_pct = min(int((t['proteinas'] / DAILY_GOALS['proteinas']) * 100), 100)
+        cal_bar = "█" * int(cal_pct/10) + "░" * (10 - int(cal_pct/10))
+        prot_bar = "█" * int(prot_pct/10) + "░" * (10 - int(prot_pct/10))
+        lines.append("*Progreso:*")
+        lines.append(f"🔥 {t['calorias']}/{DAILY_GOALS['calorias']} kcal\n`{cal_bar}` {cal_pct}%")
+        lines.append(f"💪 {t['proteinas']}/{DAILY_GOALS['proteinas']}g prot\n`{prot_bar}` {prot_pct}%")
     else:
-        lines.append("_Sin comidas registradas todavía._\n")
-
+        lines.append("_Sin comidas registradas._")
     if doc["entrenamientos"]:
-        lines.append("*Entrenamientos:*")
-        for e in doc["entrenamientos"]:
-            lines.append(f"• {e['descripcion']}")
-        lines.append("")
-
-    if doc["comidas"]:
-        lines.append("*Progreso macros:*\n")
-        lines.append(format_progress(doc["totales"]))
-
+        lines.append(f"\n🏋️ *Entrenó:* {doc['entrenamientos'][0]['descripcion']}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
     docs = list(collection.find({"user_id": uid}).sort("fecha", -1).limit(7))
-
     if not docs:
         await update.message.reply_text("📭 No tenés historial todavía.")
         return
-
     lines = ["*📅 Últimos 7 días:*\n"]
     for d in docs:
         t = d["totales"]
@@ -180,7 +216,23 @@ async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "✅" if prot_pct >= 80 and cal_pct <= 110 else "⚠️"
         entreno = "🏋️" if d.get("entrenamientos") else "😴"
         lines.append(f"{status}{entreno} *{d['fecha']}*: {t['calorias']} kcal | {t['proteinas']}g prot ({prot_pct}%)")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
+async def logros(update, context):
+    uid = str(update.effective_user.id)
+    _, stats = check_new_achievements(collection, uid, logros_col)
+    earned_ids = set(l["id"] for l in logros_col.find({"user_id": uid}))
+    lines = ["🏅 *Tus logros*\n"]
+    lines.append(f"🔥 Racha actual: *{stats['racha_actual']} días*")
+    lines.append(f"🏋️ Total entrenamientos: *{stats['total_entrenos']}*")
+    lines.append(f"💪 Días con proteína cumplida: *{stats['dias_proteina_ok']}*")
+    lines.append(f"📉 Días en déficit: *{stats['dias_calorias_ok']}*\n")
+    lines.append("*Logros:*")
+    for l in LOGROS:
+        if l["id"] in earned_ids:
+            lines.append(f"✅ {l['emoji']} *{l['nombre']}* — _{l['desc']}_")
+        else:
+            lines.append(f"🔒 ??? — _{l['desc']}_")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -190,93 +242,78 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {"user_id": uid, "fecha": today},
         {"$set": {"comidas": [], "entrenamientos": [], "totales": {"calorias": 0, "proteinas": 0, "carbohidratos": 0, "grasas": 0}}}
     )
+    conversaciones_col.delete_one({"user_id": uid, "fecha": today})
     await update.message.reply_text("🔄 Día reiniciado.")
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎙️ Los audios estarán disponibles próximamente.\n\nPor ahora escribí lo que comiste o entrenaste.")
+    await update.message.reply_text("🎙️ Los audios vienen pronto. Por ahora escribime.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    await update.message.reply_text("🔍 Procesando...")
+    user_id = update.effective_user.id
+    uid = str(user_id)
 
     try:
-        result = analyze_with_claude(text)
-        doc = get_user_today(update.effective_user.id)
-
-        if result["tipo"] == "comida":
-            doc["comidas"].append(result)
+        history = get_conversation_history(user_id)
+        context_today = build_context(user_id)
+        
+        system_with_context = SISTEMA + f"\n\nCONTEXTO ACTUAL DEL DÍA:\n{context_today}"
+        
+        history.append({"role": "user", "content": text})
+        
+        response = client_ai.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=800,
+            system=system_with_context,
+            messages=history
+        )
+        
+        raw_response = response.content[0].text
+        clean_response, datos = extract_and_clean(raw_response)
+        
+        history.append({"role": "assistant", "content": raw_response})
+        save_conversation_history(user_id, history)
+        
+        await update.message.reply_text(clean_response, parse_mode="Markdown")
+        
+        if datos and datos.get("tipo") == "comida":
+            doc = get_user_today(user_id)
+            doc["comidas"].append(datos)
             for macro in ["calorias", "proteinas", "carbohidratos", "grasas"]:
-                doc["totales"][macro] += result[macro]
-            save_user_today(update.effective_user.id, doc)
-
-            t = doc["totales"]
-            cal_rest = DAILY_GOALS["calorias"] - t["calorias"]
-            prot_rest = DAILY_GOALS["proteinas"] - t["proteinas"]
-            cal_status = "✅" if cal_rest >= 0 else f"⚠️ Pasaste por {abs(cal_rest)} kcal"
-            prot_status = "✅ Meta cumplida" if prot_rest <= 0 else f"Faltan {prot_rest}g"
-
-            msg = f"""✅ *Registrado: {result['descripcion']}*
-
-🔥 {result['calorias']} kcal | 💪 {result['proteinas']}g | 🌾 {result['carbohidratos']}g | 🫒 {result['grasas']}g
-
-_{result['comentario']}_
-
-*Acumulado hoy:*
-🔥 {t['calorias']} / {DAILY_GOALS['calorias']} kcal — {cal_status}
-💪 {t['proteinas']} / {DAILY_GOALS['proteinas']}g proteína — {prot_status}
-
-Usá /hoy para el resumen completo."""
-            await update.message.reply_text(msg, parse_mode="Markdown")
-
-        elif result["tipo"] == "entrenamiento":
-            doc["entrenamientos"].append({"descripcion": result["descripcion"]})
-            save_user_today(update.effective_user.id, doc)
+                doc["totales"][macro] += datos.get(macro, 0)
+            save_user_today(user_id, doc)
             
-            uid = str(update.effective_user.id)
+            t = doc["totales"]
+            progress = format_progress_inline(t)
+            await update.message.reply_text(f"📊 {progress}", parse_mode="Markdown")
+            
+            new_achievements, _ = check_new_achievements(collection, uid, logros_col)
+            for logro in new_achievements:
+                await update.message.reply_text(
+                    f"🏅 *LOGRO: {logro['nombre']}* {logro['emoji']}\n_{logro['desc']}_",
+                    parse_mode="Markdown"
+                )
+
+        elif datos and datos.get("tipo") == "entrenamiento":
+            doc = get_user_today(user_id)
+            if not doc["entrenamientos"]:
+                doc["entrenamientos"].append({"descripcion": datos.get("descripcion", "Entrenamiento")})
+                save_user_today(user_id, doc)
+            
             new_achievements, stats = check_new_achievements(collection, uid, logros_col)
             
-            racha = stats["racha_actual"]
-            racha_txt = f"\n🔥 *Racha: {racha} día(s) consecutivo(s)*" if racha > 1 else ""
-            total_txt = f"\n💪 Total acumulado: *{stats['total_entrenos']} entrenos*"
-            
-            msg = f"""🏋️ *Entrenamiento registrado*\n\n{result['descripcion']}\n\n_{result['comentario']}_\n{racha_txt}{total_txt}\n\nUsá /hoy para ver el resumen del día."""
-            await update.message.reply_text(msg, parse_mode="Markdown")
+            if stats["racha_actual"] > 1:
+                await update.message.reply_text(f"🔥 Racha: *{stats['racha_actual']} días* | Total: *{stats['total_entrenos']} entrenamientos*", parse_mode="Markdown")
             
             for logro in new_achievements:
                 await update.message.reply_text(
-                    f"🏅 *LOGRO DESBLOQUEADO: {logro['nombre']}* {logro['emoji']}\n\n_{logro['desc']}_\n\n¡La estás rompiendo, Agustín!",
+                    f"🏅 *LOGRO: {logro['nombre']}* {logro['emoji']}\n_{logro['desc']}_",
                     parse_mode="Markdown"
                 )
-        else:
-            await update.message.reply_text(result["respuesta"])
 
     except Exception as e:
-        logger.error(f"Error: {e}")
-        await update.message.reply_text("❌ Hubo un error. Intentá de nuevo.")
-
-
-async def logros(update, context):
-    uid = str(update.effective_user.id)
-    _, stats = check_new_achievements(collection, uid, logros_col)
-    earned = list(logros_col.find({"user_id": uid}))
-    earned_ids = set(l["id"] for l in earned)
-    
-    lines = ["🏅 *Tus logros*\n"]
-    
-    lines.append(f"🔥 Racha actual: *{stats['racha_actual']} días*")
-    lines.append(f"🏋️ Total entrenamientos: *{stats['total_entrenos']}*")
-    lines.append(f"💪 Días con proteína cumplida: *{stats['dias_proteina_ok']}*")
-    lines.append(f"📉 Días en déficit calórico: *{stats['dias_calorias_ok']}*\n")
-    
-    lines.append("*Logros desbloqueados:*")
-    from achievements import LOGROS
-    for l in LOGROS:
-        if l["id"] in earned_ids:
-            lines.append(f"✅ {l['emoji']} {l['nombre']} — _{l['desc']}_")
-        else:
-            lines.append(f"🔒 ??? — _{l['desc']}_")
-    
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+        logger.error(f"Error: {traceback.format_exc()}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
@@ -289,11 +326,9 @@ async def entrenamiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dia_key = args[0].upper()
     else:
         dia_key = get_dia_hoy()
-
     if not dia_key:
-        await update.message.reply_text("💤 *Hoy es día de descanso.*\n\nPodés consultar un día específico con:\n/entrenamiento A\n/entrenamiento B\n/entrenamiento C", parse_mode="Markdown")
+        await update.message.reply_text("💤 *Hoy es día de descanso.*\n\n/entrenamiento A · B · C para ver un día específico.", parse_mode="Markdown")
         return
-
     dia = PLAN[dia_key]
     lines = [f"🏋️ *{dia['nombre']}*\n_{dia['enfasis']}_\n"]
     for g in dia["grupos"]:
@@ -301,12 +336,12 @@ async def entrenamiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for ex in g["ejercicios"]:
             lines.append(f"• {ex['nombre']} — {ex['series']}\n  _{ex['porcion']}_")
         lines.append("")
-    lines.append("Usá /ejercicio nombre para ver cómo se hace cualquier ejercicio.")
+    lines.append("Usá /ejercicio nombre para ver cómo se hace.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def ejercicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Escribí el nombre del ejercicio.\nEjemplo: /ejercicio curl martillo")
+        await update.message.reply_text("Ejemplo: /ejercicio curl martillo")
         return
     query = " ".join(context.args).lower()
     encontrado = None
@@ -317,9 +352,9 @@ async def ejercicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     encontrado = ex
                     break
     if not encontrado:
-        await update.message.reply_text(f"❌ No encontré *{query}*.\n\nUsá /entrenamiento para ver todos los ejercicios.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ No encontré *{query}*.", parse_mode="Markdown")
         return
-    msg = f"💪 *{encontrado['nombre']}*\n_{encontrado['porcion']}_\n\n*Series:* {encontrado['series']}\n\n*Cómo se hace:*\n{encontrado['como']}\n\n*Tip:*\n_{encontrado['tip']}_"
+    msg = f"💪 *{encontrado['nombre']}*\n_{encontrado['porcion']}_\n\n*Series:* {encontrado['series']}\n\n*Cómo:*\n{encontrado['como']}\n\n*Tip:*\n_{encontrado['tip']}_"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -334,7 +369,6 @@ async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             lines.append(f"*{nombre}* — Descanso 💤{marcador}")
         lines.append("")
-    lines.append("Usá /entrenamiento para ver los ejercicios de hoy.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 def main():
@@ -342,9 +376,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("hoy", hoy))
     app.add_handler(CommandHandler("historial", historial))
+    app.add_handler(CommandHandler("logros", logros))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("ayuda", ayuda))
-    app.add_handler(CommandHandler("logros", logros))
     app.add_handler(CommandHandler("entrenamiento", entrenamiento))
     app.add_handler(CommandHandler("ejercicio", ejercicio))
     app.add_handler(CommandHandler("semana", semana_cmd))
