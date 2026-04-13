@@ -21,7 +21,7 @@ MONGODB_URL = os.environ["MONGODB_URL"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
-mongo = MongoClient(MONGODB_URL)
+mongo = MongoClient(MONGODB_URL, tls=True, tlsAllowInvalidCertificates=True)
 db = mongo["nutrition-bot"]
 collection = db["registros"]
 logros_col = db["logros"]
@@ -295,7 +295,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         history.append({"role": "assistant", "content": raw_response})
         save_conversation_history(user_id, history)
         
-        await update.message.reply_text(clean_response, parse_mode="Markdown")
+        try:
+            await update.message.reply_text(clean_response, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(clean_response)
         
         if datos and datos.get("tipo") == "comida":
             doc = get_user_today(user_id)
