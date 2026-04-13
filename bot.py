@@ -3,20 +3,25 @@ import json
 import logging
 import tempfile
 from datetime import datetime, date
+import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
-import httpx
+from pymongo import MongoClient
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+MONGODB_URL = os.environ["MONGODB_URL"]
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+mongo = MongoClient(MONGODB_URL)
+db = mongo["nutrition-bot"]
+collection = db["registros"]
 
-DATA_FILE = "nutrition_data.json"
+ARG_TZ = pytz.timezone("America/Argentina/Buenos_Aires")
 
 DAILY_GOALS = {
     "calorias": 1900,
@@ -25,235 +30,218 @@ DAILY_GOALS = {
     "grasas": 65
 }
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+def get_today_arg():
+    return datetime.now(ARG_TZ).strftime("%Y-%m-%d")
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def get_today_key():
-    return date.today().isoformat()
-
-def get_user_today(data, user_id):
+def get_user_today(user_id):
+    today = get_today_arg()
     uid = str(user_id)
-    today = get_today_key()
-    if uid not in data:
-        data[uid] = {}
-    if today not in data[uid]:
-        data[uid][today] = {"comidas": [], "totales": {"calorias": 0, "proteinas": 0, "carbohidratos": 0, "grasas": 0}}
-    return data[uid][today]
+    doc = collection.find_one({"user_id": uid, "fecha": today})
+    if not doc:
+        doc = {
+            "user_id": uid,
+            "fecha": today,
+            "comidas": [],
+            "entrenamientos": [],
+            "totales": {"calorias": 0, "proteinas": 0, "carbohidratos": 0, "grasas": 0}
+        }
+        collection.insert_one(doc)
+        doc = collection.find_one({"user_id": uid, "fecha": today})
+    return doc
 
-def analyze_food_with_claude(text):
-    prompt = f"""Sos un nutricionista experto. El usuario te dice lo que comió: "{text}"
+def save_user_today(user_id, doc):
+    today = get_today_arg()
+    uid = str(user_id)
+    collection.update_one(
+        {"user_id": uid, "fecha": today},
+        {"$set": {
+            "comidas": doc["comidas"],
+            "entrenamientos": doc["entrenamientos"],
+            "totales": doc["totales"]
+        }}
+    )
 
-Analizá los alimentos mencionados y devolvé SOLO un JSON válido con este formato exacto, sin texto extra:
-{{
-  "descripcion": "descripción corta de lo que comió",
-  "calorias": número,
-  "proteinas": número en gramos,
-  "carbohidratos": número en gramos,
-  "grasas": número en gramos,
-  "comentario": "un comentario breve nutricional en español rioplatense"
-}}
+def analyze_with_claude(text):
+    prompt = f"""Sos un asistente de nutrición y entrenamiento. El usuario te manda este mensaje: "{text}"
 
-Si no podés identificar comida en el texto, devolvé:
-{{"error": "No pude identificar alimentos en el mensaje"}}
+Primero determiná si el mensaje es sobre:
+1. COMIDA - el usuario describe algo que comió o tomó
+2. ENTRENAMIENTO - el usuario menciona que hizo ejercicio, fue al gym, hizo el día A/B/C, entrenó, etc.
+3. OTRO - consulta, saludo, o cualquier otra cosa
 
-Usá valores estimados realistas para porciones típicas argentinas."""
+Respondé SOLO con un JSON válido sin texto extra:
 
-    response = client.messages.create(
+Si es COMIDA:
+{{"tipo": "comida", "descripcion": "descripción corta", "calorias": número, "proteinas": número, "carbohidratos": número, "grasas": número, "comentario": "comentario breve en español rioplatense"}}
+
+Si es ENTRENAMIENTO:
+{{"tipo": "entrenamiento", "descripcion": "qué entrenamiento hizo", "comentario": "comentario motivador breve en español rioplatense"}}
+
+Si es OTRO:
+{{"tipo": "otro", "respuesta": "respuesta breve y amigable en español rioplatense"}}
+
+Usá valores realistas para porciones argentinas típicas."""
+
+    response = client_ai.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=500,
         messages=[{"role": "user", "content": prompt}]
     )
-    
-    raw = response.content[0].text.strip()
-    raw = raw.replace("```json", "").replace("```", "").strip()
+    raw = response.content[0].text.strip().replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
-
-async def transcribe_audio_with_whisper(file_path):
-    return None
 
 def format_progress(totales):
     lines = []
-    for macro, goal_key in [("calorias", "calorias"), ("proteinas", "proteinas"), ("carbohidratos", "carbohidratos"), ("grasas", "grasas")]:
+    items = [
+        ("calorias", "🔥", "kcal"),
+        ("proteinas", "💪", "g"),
+        ("carbohidratos", "🌾", "g"),
+        ("grasas", "🫒", "g")
+    ]
+    for macro, emoji, unit in items:
         actual = totales[macro]
-        goal = DAILY_GOALS[goal_key]
+        goal = DAILY_GOALS[macro]
         pct = min(int((actual / goal) * 100), 100)
-        bar_filled = int(pct / 10)
-        bar = "█" * bar_filled + "░" * (10 - bar_filled)
-        unit = "kcal" if macro == "calorias" else "g"
-        emoji = "🔥" if macro == "calorias" else "💪" if macro == "proteinas" else "🌾" if macro == "carbohidratos" else "🫒"
+        bar = "█" * int(pct/10) + "░" * (10 - int(pct/10))
         lines.append(f"{emoji} *{macro.capitalize()}*: {actual}{unit} / {goal}{unit}\n`{bar}` {pct}%")
     return "\n\n".join(lines)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = """👋 *¡Hola! Soy tu bot de nutrición.*
+    msg = """👋 *¡Hola! Soy tu bot de nutrición y entrenamiento.*
 
-Mandame un *mensaje de voz* o *texto* contando lo que comiste y voy a registrar las calorías y macros automáticamente.
+Contame lo que comiste o si entrenaste y lo registro automáticamente.
 
-*Comandos disponibles:*
-/hoy — Ver resumen del día
-/historial — Ver los últimos 7 días
-/reset — Reiniciar el día actual
+*Comandos:*
+/hoy — Resumen del día
+/historial — Últimos 7 días
+/entrenamiento — Ejercicios de hoy
+/entrenamiento A · B · C — Ver un día específico
+/ejercicio [nombre] — Cómo hacer un ejercicio
+/semana — Semana completa
+/reset — Reiniciar el día
 /ayuda — Ver esta ayuda
 
-*Ejemplos de lo que podés decirme:*
-• "Me comí 3 huevos revueltos con aguacate y una tostada"
-• "Almorcé pechuga de pollo con ensalada"
-• "Tomé un batido de proteínas con banana"
-
-¡Empezá contándome qué comiste hoy! 🥗"""
+*Ejemplos:*
+• "Comí 3 huevos con aguacate y una tostada"
+• "Hice el entrenamiento de hoy"
+• "Tomé un café con leche"
+• "Fui al gym e hice el día B" """
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 async def hoy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    today_data = get_user_today(data, update.effective_user.id)
-    
-    if not today_data["comidas"]:
-        await update.message.reply_text("📭 Todavía no registraste nada hoy. ¡Mandame un audio o texto con lo que comiste!")
-        return
-    
-    comidas_text = "\n".join([f"• {c['descripcion']} — {c['calorias']} kcal, {c['proteinas']}g prot" for c in today_data["comidas"]])
-    progress = format_progress(today_data["totales"])
-    
-    msg = f"""📊 *Resumen de hoy — {get_today_key()}*
+    doc = get_user_today(update.effective_user.id)
 
-*Lo que registraste:*
-{comidas_text}
+    lines = [f"📊 *Resumen de hoy — {get_today_arg()}*\n"]
 
-*Progreso hacia tus metas:*
+    if doc["comidas"]:
+        lines.append("*Comidas registradas:*")
+        for c in doc["comidas"]:
+            lines.append(f"• {c['descripcion']} — {c['calorias']} kcal, {c['proteinas']}g prot")
+        lines.append("")
+    else:
+        lines.append("_Sin comidas registradas todavía._\n")
 
-{progress}"""
-    
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    if doc["entrenamientos"]:
+        lines.append("*Entrenamientos:*")
+        for e in doc["entrenamientos"]:
+            lines.append(f"• {e['descripcion']}")
+        lines.append("")
+
+    if doc["comidas"]:
+        lines.append("*Progreso macros:*\n")
+        lines.append(format_progress(doc["totales"]))
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def historial(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
     uid = str(update.effective_user.id)
-    
-    if uid not in data or not data[uid]:
+    docs = list(collection.find({"user_id": uid}).sort("fecha", -1).limit(7))
+
+    if not docs:
         await update.message.reply_text("📭 No tenés historial todavía.")
         return
-    
-    days = sorted(data[uid].keys(), reverse=True)[:7]
-    lines = []
-    for day in days:
-        d = data[uid][day]
+
+    lines = ["*📅 Últimos 7 días:*\n"]
+    for d in docs:
         t = d["totales"]
         prot_pct = int((t["proteinas"] / DAILY_GOALS["proteinas"]) * 100)
         cal_pct = int((t["calorias"] / DAILY_GOALS["calorias"]) * 100)
         status = "✅" if prot_pct >= 80 and cal_pct <= 110 else "⚠️"
-        lines.append(f"{status} *{day}*: {t['calorias']} kcal | {t['proteinas']}g prot ({prot_pct}%)")
-    
-    msg = "*📅 Últimos 7 días:*\n\n" + "\n".join(lines)
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        entreno = "🏋️" if d.get("entrenamientos") else "😴"
+        lines.append(f"{status}{entreno} *{d['fecha']}*: {t['calorias']} kcal | {t['proteinas']}g prot ({prot_pct}%)")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
     uid = str(update.effective_user.id)
-    today = get_today_key()
-    if uid in data and today in data[uid]:
-        data[uid][today] = {"comidas": [], "totales": {"calorias": 0, "proteinas": 0, "carbohidratos": 0, "grasas": 0}}
-        save_data(data)
-    await update.message.reply_text("🔄 Día reiniciado. Empezá de cero.")
+    today = get_today_arg()
+    collection.update_one(
+        {"user_id": uid, "fecha": today},
+        {"$set": {"comidas": [], "entrenamientos": [], "totales": {"calorias": 0, "proteinas": 0, "carbohidratos": 0, "grasas": 0}}}
+    )
+    await update.message.reply_text("🔄 Día reiniciado.")
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎙️ Los audios estarán disponibles próximamente.\n\nPor ahora escribí lo que comiste o entrenaste.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    await process_food_entry(update, context, text)
+    await update.message.reply_text("🔍 Procesando...")
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎙️ Escuchando tu audio...")
-    
     try:
-        voice = update.message.voice
-        file = await context.bot.get_file(voice.file_id)
-        
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
-            tmp_path = tmp.name
-        
-        await file.download_to_drive(tmp_path)
-        
-        transcription = await transcribe_audio_with_whisper(tmp_path)
-        os.unlink(tmp_path)
-        
-        await update.message.reply_text(f"📝 *Escuché:* _{transcription}_", parse_mode="Markdown")
-        await process_food_entry(update, context, transcription)
-        
-    except Exception as e:
-        logger.error(f"Error procesando audio: {e}")
-        await update.message.reply_text("❌ No pude procesar el audio. Intentá escribir lo que comiste.")
+        result = analyze_with_claude(text)
+        doc = get_user_today(update.effective_user.id)
 
-async def process_food_entry(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    await update.message.reply_text("🔍 Analizando...")
-    
-    try:
-        result = analyze_food_with_claude(text)
-        
-        if "error" in result:
-            await update.message.reply_text(f"🤔 {result['error']}\n\nContame qué comiste con más detalle.")
-            return
-        
-        data = load_data()
-        today_data = get_user_today(data, update.effective_user.id)
-        
-        today_data["comidas"].append(result)
-        for macro in ["calorias", "proteinas", "carbohidratos", "grasas"]:
-            today_data["totales"][macro] += result[macro]
-        
-        save_data(data)
-        
-        t = today_data["totales"]
-        cal_restantes = DAILY_GOALS["calorias"] - t["calorias"]
-        prot_restantes = DAILY_GOALS["proteinas"] - t["proteinas"]
-        
-        cal_status = "✅" if cal_restantes >= 0 else "⚠️ Pasaste el límite"
-        prot_status = "✅" if prot_restantes <= 0 else f"Faltan {prot_restantes}g"
-        
-        msg = f"""✅ *Registrado: {result['descripcion']}*
+        if result["tipo"] == "comida":
+            doc["comidas"].append(result)
+            for macro in ["calorias", "proteinas", "carbohidratos", "grasas"]:
+                doc["totales"][macro] += result[macro]
+            save_user_today(update.effective_user.id, doc)
 
-🔥 {result['calorias']} kcal | 💪 {result['proteinas']}g prot | 🌾 {result['carbohidratos']}g carbs | 🫒 {result['grasas']}g grasas
+            t = doc["totales"]
+            cal_rest = DAILY_GOALS["calorias"] - t["calorias"]
+            prot_rest = DAILY_GOALS["proteinas"] - t["proteinas"]
+            cal_status = "✅" if cal_rest >= 0 else f"⚠️ Pasaste por {abs(cal_rest)} kcal"
+            prot_status = "✅ Meta cumplida" if prot_rest <= 0 else f"Faltan {prot_rest}g"
+
+            msg = f"""✅ *Registrado: {result['descripcion']}*
+
+🔥 {result['calorias']} kcal | 💪 {result['proteinas']}g | 🌾 {result['carbohidratos']}g | 🫒 {result['grasas']}g
 
 _{result['comentario']}_
 
 *Acumulado hoy:*
-🔥 {t['calorias']} / {DAILY_GOALS['calorias']} kcal {cal_status}
+🔥 {t['calorias']} / {DAILY_GOALS['calorias']} kcal — {cal_status}
 💪 {t['proteinas']} / {DAILY_GOALS['proteinas']}g proteína — {prot_status}
 
-Usá /hoy para ver el resumen completo."""
-        
-        await update.message.reply_text(msg, parse_mode="Markdown")
-        
+Usá /hoy para el resumen completo."""
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        elif result["tipo"] == "entrenamiento":
+            doc["entrenamientos"].append({"descripcion": result["descripcion"]})
+            save_user_today(update.effective_user.id, doc)
+            msg = f"""🏋️ *Entrenamiento registrado*
+
+{result['descripcion']}
+
+_{result['comentario']}_
+
+Usá /hoy para ver el resumen del día."""
+            await update.message.reply_text(msg, parse_mode="Markdown")
+
+        else:
+            await update.message.reply_text(result["respuesta"])
+
     except Exception as e:
-        logger.error(f"Error analizando comida: {e}")
-        await update.message.reply_text("❌ Hubo un error analizando tu comida. Intentá de nuevo.")
+        logger.error(f"Error: {e}")
+        await update.message.reply_text("❌ Hubo un error. Intentá de nuevo.")
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
-def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("hoy", hoy))
-    app.add_handler(CommandHandler("historial", historial))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("ayuda", ayuda))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    
-    logger.info("Bot iniciado...")
-    app.run_polling(drop_pending_updates=True)
-
-
-
 from training_module import PLAN, SEMANA, get_dia_hoy
 
-async def entrenamiento(update, context):
+async def entrenamiento(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if args and args[0].upper() in ["A", "B", "C"]:
         dia_key = args[0].upper()
@@ -274,7 +262,7 @@ async def entrenamiento(update, context):
     lines.append("Usá /ejercicio nombre para ver cómo se hace cualquier ejercicio.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-async def ejercicio(update, context):
+async def ejercicio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Escribí el nombre del ejercicio.\nEjemplo: /ejercicio curl martillo")
         return
@@ -292,14 +280,13 @@ async def ejercicio(update, context):
     msg = f"💪 *{encontrado['nombre']}*\n_{encontrado['porcion']}_\n\n*Series:* {encontrado['series']}\n\n*Cómo se hace:*\n{encontrado['como']}\n\n*Tip:*\n_{encontrado['tip']}_"
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-async def semana_cmd(update, context):
+async def semana_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     dias_nombres = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-    from datetime import date
-    hoy = date.today().weekday()
+    hoy_idx = datetime.now(ARG_TZ).weekday()
     lines = ["📅 *Semana de entrenamiento:*\n"]
     for i, nombre in enumerate(dias_nombres):
         dia_key = SEMANA.get(i)
-        marcador = " ◀ hoy" if i == hoy else ""
+        marcador = " ◀ hoy" if i == hoy_idx else ""
         if dia_key:
             lines.append(f"*{nombre}* — Día {dia_key}{marcador}\n_{PLAN[dia_key]['enfasis']}_")
         else:
@@ -308,10 +295,7 @@ async def semana_cmd(update, context):
     lines.append("Usá /entrenamiento para ver los ejercicios de hoy.")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-from telegram.ext import Application, CommandHandler, MessageHandler, filters as tg_filters
-
-def main_v2():
-    from telegram.ext import Application
+def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("hoy", hoy))
@@ -323,8 +307,8 @@ def main_v2():
     app.add_handler(CommandHandler("semana", semana_cmd))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    logger.info("Bot iniciado con módulo de entrenamiento...")
+    logger.info("Bot iniciado...")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main_v2()
+    main()
