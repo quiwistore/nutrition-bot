@@ -7,17 +7,14 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 import httpx
-from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 DATA_FILE = "nutrition_data.json"
 
@@ -79,13 +76,7 @@ Usá valores estimados realistas para porciones típicas argentinas."""
     return json.loads(raw)
 
 async def transcribe_audio_with_whisper(file_path):
-    with open(file_path, "rb") as f:
-        transcript = openai_client.audio.transcriptions.create(
-            model="whisper-1",
-            file=f,
-            language="es"
-        )
-    return transcript.text
+    return None
 
 def format_progress(totales):
     lines = []
