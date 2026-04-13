@@ -7,14 +7,17 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 import httpx
+from openai import OpenAI
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
 DATA_FILE = "nutrition_data.json"
 
@@ -75,35 +78,14 @@ Usá valores estimados realistas para porciones típicas argentinas."""
     raw = raw.replace("```json", "").replace("```", "").strip()
     return json.loads(raw)
 
-async def transcribe_audio_with_claude(file_path):
+async def transcribe_audio_with_whisper(file_path):
     with open(file_path, "rb") as f:
-        audio_data = f.read()
-    
-    import base64
-    audio_b64 = base64.b64encode(audio_data).decode()
-    
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=300,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Transcribí exactamente lo que dice este audio de voz. Devolvé solo el texto transcripto, sin comentarios."
-                },
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "audio/ogg",
-                        "data": audio_b64
-                    }
-                }
-            ]
-        }]
-    )
-    return response.content[0].text.strip()
+        transcript = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=f,
+            language="es"
+        )
+    return transcript.text
 
 def format_progress(totales):
     lines = []
@@ -205,7 +187,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         await file.download_to_drive(tmp_path)
         
-        transcription = await transcribe_audio_with_claude(tmp_path)
+        transcription = await transcribe_audio_with_whisper(tmp_path)
         os.unlink(tmp_path)
         
         await update.message.reply_text(f"📝 *Escuché:* _{transcription}_", parse_mode="Markdown")
@@ -276,5 +258,82 @@ def main():
     logger.info("Bot iniciado...")
     app.run_polling(drop_pending_updates=True)
 
+
+
+from training_module import PLAN, SEMANA, get_dia_hoy
+
+async def entrenamiento(update, context):
+    args = context.args
+    if args and args[0].upper() in ["A", "B", "C"]:
+        dia_key = args[0].upper()
+    else:
+        dia_key = get_dia_hoy()
+
+    if not dia_key:
+        await update.message.reply_text("💤 *Hoy es día de descanso.*\n\nPodés consultar un día específico con:\n/entrenamiento A\n/entrenamiento B\n/entrenamiento C", parse_mode="Markdown")
+        return
+
+    dia = PLAN[dia_key]
+    lines = [f"🏋️ *{dia['nombre']}*\n_{dia['enfasis']}_\n"]
+    for g in dia["grupos"]:
+        lines.append(f"*{g['grupo']}*")
+        for ex in g["ejercicios"]:
+            lines.append(f"• {ex['nombre']} — {ex['series']}\n  _{ex['porcion']}_")
+        lines.append("")
+    lines.append("Usá /ejercicio nombre para ver cómo se hace cualquier ejercicio.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def ejercicio(update, context):
+    if not context.args:
+        await update.message.reply_text("Escribí el nombre del ejercicio.\nEjemplo: /ejercicio curl martillo")
+        return
+    query = " ".join(context.args).lower()
+    encontrado = None
+    for dia in PLAN.values():
+        for g in dia["grupos"]:
+            for ex in g["ejercicios"]:
+                if query in ex["nombre"].lower():
+                    encontrado = ex
+                    break
+    if not encontrado:
+        await update.message.reply_text(f"❌ No encontré *{query}*.\n\nUsá /entrenamiento para ver todos los ejercicios.", parse_mode="Markdown")
+        return
+    msg = f"💪 *{encontrado['nombre']}*\n_{encontrado['porcion']}_\n\n*Series:* {encontrado['series']}\n\n*Cómo se hace:*\n{encontrado['como']}\n\n*Tip:*\n_{encontrado['tip']}_"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def semana_cmd(update, context):
+    dias_nombres = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+    from datetime import date
+    hoy = date.today().weekday()
+    lines = ["📅 *Semana de entrenamiento:*\n"]
+    for i, nombre in enumerate(dias_nombres):
+        dia_key = SEMANA.get(i)
+        marcador = " ◀ hoy" if i == hoy else ""
+        if dia_key:
+            lines.append(f"*{nombre}* — Día {dia_key}{marcador}\n_{PLAN[dia_key]['enfasis']}_")
+        else:
+            lines.append(f"*{nombre}* — Descanso 💤{marcador}")
+        lines.append("")
+    lines.append("Usá /entrenamiento para ver los ejercicios de hoy.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+from telegram.ext import Application, CommandHandler, MessageHandler, filters as tg_filters
+
+def main_v2():
+    from telegram.ext import Application
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("hoy", hoy))
+    app.add_handler(CommandHandler("historial", historial))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("ayuda", ayuda))
+    app.add_handler(CommandHandler("entrenamiento", entrenamiento))
+    app.add_handler(CommandHandler("ejercicio", ejercicio))
+    app.add_handler(CommandHandler("semana", semana_cmd))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    logger.info("Bot iniciado con módulo de entrenamiento...")
+    app.run_polling(drop_pending_updates=True)
+
 if __name__ == "__main__":
-    main()
+    main_v2()
