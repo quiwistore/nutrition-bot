@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 from pymongo import MongoClient
+from openai import OpenAI
 from achievements import check_new_achievements, get_user_stats, LOGROS
 
 logging.basicConfig(level=logging.INFO)
@@ -17,7 +18,9 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 MONGODB_URL = os.environ["MONGODB_URL"]
 
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 client_ai = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 mongo = MongoClient(MONGODB_URL)
 db = mongo["nutrition-bot"]
 collection = db["registros"]
@@ -246,7 +249,27 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔄 Día reiniciado.")
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎙️ Los audios vienen pronto. Por ahora escribime.")
+    try:
+        import tempfile
+        voice = update.message.voice
+        file = await context.bot.get_file(voice.file_id)
+        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+            tmp_path = tmp.name
+        await file.download_to_drive(tmp_path)
+        with open(tmp_path, "rb") as f:
+            transcript = openai_client.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="es"
+            )
+        os.unlink(tmp_path)
+        transcription = transcript.text
+        update.message.text = transcription
+        await update.message.reply_text(f"🎙️ _{transcription}_", parse_mode="Markdown")
+        await handle_text(update, context)
+    except Exception as e:
+        logger.error(f"Error audio: {traceback.format_exc()}")
+        await update.message.reply_text("❌ No pude procesar el audio. Escribime.")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
