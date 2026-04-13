@@ -264,15 +264,13 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         os.unlink(tmp_path)
         transcription = transcript.text
-        update.message.text = transcription
         await update.message.reply_text(f"🎙️ _{transcription}_", parse_mode="Markdown")
-        await handle_text(update, context)
+        await process_message(update, context, transcription)
     except Exception as e:
         logger.error(f"Error audio: {traceback.format_exc()}")
         await update.message.reply_text("❌ No pude procesar el audio. Escribime.")
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
+async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
     uid = str(user_id)
 
@@ -337,6 +335,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Error: {traceback.format_exc()}")
         await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await process_message(update, context, update.message.text)
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
