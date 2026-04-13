@@ -8,6 +8,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import anthropic
 from pymongo import MongoClient
+from achievements import check_new_achievements, get_user_stats, LOGROS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,7 +83,14 @@ Si es ENTRENAMIENTO:
 Si es OTRO:
 {{"tipo": "otro", "respuesta": "respuesta breve y amigable en español rioplatense"}}
 
-Usá valores realistas para porciones argentinas típicas."""
+Para el campo "comentario" en comidas SÉ MUY HONESTO y divertido. Ejemplos del tono que buscamos:
+- Si comió bien: "Eso es lo que es, proteína al palo. Seguila así."
+- Si comió medialunas/alfajores/facturas: "Bah, las medialunas... clásico. Disfrutaste, pero no te olvides que eso no te acerca a los abs."
+- Si comió pizza: "La pizza semanal, bienvenida. Contala como el cheat del día y mañana volvemos al plan."
+- Si comió pollo con ensalada: "Eso sí que es comer como un campeón. Sos un monstruo."
+- Si se pasó de calorías: "Hoy te fuiste de mambo con las calorías. Mañana la revancha, no drama."
+- Si cumplió la proteína: "¡Meta de proteína cumplida! Así se construye músculo, no con rezos."
+Usá humor rioplatense, bardeo con cariño y motivación real. Máximo 2 oraciones."""
 
     response = client_ai.messages.create(
         model="claude-sonnet-4-20250514",
@@ -121,6 +129,7 @@ Contame lo que comiste o si entrenaste y lo registro automáticamente.
 /ejercicio [nombre] — Cómo hacer un ejercicio
 /semana — Semana completa
 /reset — Reiniciar el día
+/logros — Ver tus logros y estadísticas
 /ayuda — Ver esta ayuda
 
 *Ejemplos:*
@@ -222,21 +231,52 @@ Usá /hoy para el resumen completo."""
         elif result["tipo"] == "entrenamiento":
             doc["entrenamientos"].append({"descripcion": result["descripcion"]})
             save_user_today(update.effective_user.id, doc)
-            msg = f"""🏋️ *Entrenamiento registrado*
-
-{result['descripcion']}
-
-_{result['comentario']}_
-
-Usá /hoy para ver el resumen del día."""
+            
+            uid = str(update.effective_user.id)
+            new_achievements, stats = check_new_achievements(collection, uid, logros_col)
+            
+            racha = stats["racha_actual"]
+            racha_txt = f"\n🔥 *Racha: {racha} día(s) consecutivo(s)*" if racha > 1 else ""
+            total_txt = f"\n💪 Total acumulado: *{stats['total_entrenos']} entrenos*"
+            
+            msg = f"""🏋️ *Entrenamiento registrado*\n\n{result['descripcion']}\n\n_{result['comentario']}_\n{racha_txt}{total_txt}\n\nUsá /hoy para ver el resumen del día."""
             await update.message.reply_text(msg, parse_mode="Markdown")
-
+            
+            for logro in new_achievements:
+                await update.message.reply_text(
+                    f"🏅 *LOGRO DESBLOQUEADO: {logro['nombre']}* {logro['emoji']}\n\n_{logro['desc']}_\n\n¡La estás rompiendo, Agustín!",
+                    parse_mode="Markdown"
+                )
         else:
             await update.message.reply_text(result["respuesta"])
 
     except Exception as e:
         logger.error(f"Error: {e}")
         await update.message.reply_text("❌ Hubo un error. Intentá de nuevo.")
+
+
+async def logros(update, context):
+    uid = str(update.effective_user.id)
+    _, stats = check_new_achievements(collection, uid, logros_col)
+    earned = list(logros_col.find({"user_id": uid}))
+    earned_ids = set(l["id"] for l in earned)
+    
+    lines = ["🏅 *Tus logros*\n"]
+    
+    lines.append(f"🔥 Racha actual: *{stats['racha_actual']} días*")
+    lines.append(f"🏋️ Total entrenamientos: *{stats['total_entrenos']}*")
+    lines.append(f"💪 Días con proteína cumplida: *{stats['dias_proteina_ok']}*")
+    lines.append(f"📉 Días en déficit calórico: *{stats['dias_calorias_ok']}*\n")
+    
+    lines.append("*Logros desbloqueados:*")
+    from achievements import LOGROS
+    for l in LOGROS:
+        if l["id"] in earned_ids:
+            lines.append(f"✅ {l['emoji']} {l['nombre']} — _{l['desc']}_")
+        else:
+            lines.append(f"🔒 ??? — _{l['desc']}_")
+    
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def ayuda(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
@@ -304,6 +344,7 @@ def main():
     app.add_handler(CommandHandler("historial", historial))
     app.add_handler(CommandHandler("reset", reset))
     app.add_handler(CommandHandler("ayuda", ayuda))
+    app.add_handler(CommandHandler("logros", logros))
     app.add_handler(CommandHandler("entrenamiento", entrenamiento))
     app.add_handler(CommandHandler("ejercicio", ejercicio))
     app.add_handler(CommandHandler("semana", semana_cmd))
